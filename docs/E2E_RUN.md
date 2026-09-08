@@ -24,29 +24,21 @@
 - 本地代理：`http://127.0.0.1:7897`
 - 远端入口：`127.0.0.1:17890`
 
-## 运行顺序
+## 当前命令级复验顺序
 
-以下命令必须在交互式 PowerShell 中运行，`<新测试机 alias>` 仅替换为用户新建的独立测试目标：
+以下命令必须在交互式 PowerShell 中运行；T0 阶段的 `rehearse` / `probe-*` / `observe` 为已完成的试验入口，T3 已将生产入口收敛为三个命令：
 
 ```powershell
 npm ci
-node scripts/e2e.mjs rehearse
-node scripts/e2e.mjs probe-auth --host <新测试机 alias> --mode inherit
-node scripts/e2e.mjs probe-auth --host <新测试机 alias> --mode capture
-node scripts/e2e.mjs probe-auth --host <新测试机 alias> --mode cancel
-node scripts/e2e.mjs probe-transfer --host <新测试机 alias>
-node scripts/e2e.mjs configure --host <新测试机 alias>
+node scripts/e2e.mjs configure --host <新测试机 alias> --local-proxy http://127.0.0.1:<本地端口> --remote-port <远端端口> --remote-settings <Linux 绝对路径>
 # 用户保存工作、关闭目标远端窗口并用同一 alias 重连，然后重新打开 Codex
 node scripts/e2e.mjs verify --host <新测试机 alias>
-node scripts/e2e.mjs observe --host <新测试机 alias> --pid <verify 输出的 PID>
-# observe 开始后，用户在对应 Codex 窗口发送一条新的简短请求
-node scripts/e2e.mjs configure --host <新测试机 alias>
 node scripts/e2e.mjs remove --host <新测试机 alias>
 ```
 
 如 VS Code 实际使用其他 SSH config，以上涉及目标的命令均追加 `--ssh-config <绝对路径>`。任何失败先停止，不继续写入或猜测恢复状态。
 
-`cancel` 模式必须在 OpenSSH 原生密码提示出现时按 Ctrl+C，不输入密码。三个认证探针与 SCP 探针任一失败，不得继续 configure。
+T0 的密码交互与 SCP 前置已在同一真实环境中通过；T4 复验仍须保留 OpenSSH 原生认证，不由脚本读取密码。
 
 ## 密码交互与 SCP 前置
 
@@ -86,6 +78,49 @@ node scripts/e2e.mjs remove --host <新测试机 alias>
 - 恢复边界：恢复记录不含完整配置或无关设置正文；当前摘要变化时停止，远端写失败后本地配置恢复，恢复记录创建失败时用户文件不变
 - 当前结论：T2 通过；尚未接入 `configure` / `remove` 命令，接线与命令级故障恢复属于 T3
 
+## T3 命令接线
+
+- 实现日期：2026-09-08
+- 自动测试：`node --test tests/workflow.test.mjs` 通过 12 项；`npm test` 全量验证通过
+- 命令边界：`scripts/e2e.mjs` 导出 `runCommand`，生产入口收敛为 `configure` / `verify` / `remove`；参数、交互、预览和退出码已接线
+- 写入边界：确认后才获取独占操作锁，重读摘要后依次写入 SSH 与 Remote settings；重复 configure 不修改首次恢复记录
+- 恢复边界：远端失败后逆序恢复已知状态；结果不明时保留恢复记录并停止覆盖；等价用户配置不取得所有权
+- 当前结论：T3 自动测试通过；未连接真实服务器或修改真实用户配置，T4 命令级 E2E 复验尚未执行
+
+## T4 verify 与命令级真实 E2E
+
+- 实现与复验日期：2026-09-08
+- 自动测试：`tests/transport.test.mjs` 15 项、`tests/workflow.test.mjs` 14 项，`npm test` 全量 45 项通过；`git diff --check` 通过
+- verify 边界：实现 `verifyTarget` 并固定返回五层结果；验证连接禁用转发与复用，不写配置、不发送模型请求；复验后补强为同时核对已记录 Remote settings 路径、当前远端用户归属及 Codex 扩展目录内的可执行文件，任一证据缺失时返回 `unknown`
+- configure：真实环境首次检查确认远端 `17890` 空闲；两端配置写入、摘要复读、SCP 私有暂存和清理均通过
+- 重连与 verify：用户完全关闭目标远端窗口并用同一 alias 重连；五层检查全部通过，确认新 app-server PID 21418 使用 `http://127.0.0.1:17890`，无小写代理冲突或目标绕过
+- 用户新请求与归因：主动 HTTPS 探测结束后，用户发送“只回复 OK，不执行工具”并收到新 `OK`；独立只读观察在 60 秒窗口内确认 PID 21418 到 `127.0.0.1:17890` 的连接命中 103 次，时间为 `2026-09-08T06:52:53Z` 至 `06:53:52Z`
+- 重复配置：真实环境通过；第二次 configure 报告配置无增量，回环端点及目标 HTTPS 仍通过
+- 撤销：remove 完成后恢复记录与本工具 SSH 片段均不存在；用户重连后普通 SSH 正常，`/proc/net/tcp*` 未发现 `17890` 监听
+- 当前结论：T4 通过；完整命令形成配置、重连、自动验证、人工请求归因、重复配置和安全撤销闭环
+
+## T5 失败验收与交付
+
+- 实现日期：2026-09-08
+- 自动测试：`tests/config.test.mjs` 18 项、`tests/transport.test.mjs` 15 项、`tests/workflow.test.mjs` 22 项，`npm test` 全量 55 项通过；`git diff --check` 通过
+- 恢复报告：远端状态无法确认时列出 `active.json`、SSH config、Remote settings、可选远端暂存路径和安全重试 `remove` 的命令；原始异常、Token 和完整配置不进入输出
+- 真实环境复用：密码交互与 SCP 成功路径来自 T0；两端端口不同、已知转发占用、重复配置、请求进程关联和安全移除来自 T4。未对真实代理、网络或用户配置执行破坏性故障注入
+
+| 失败或边界用例 | 结果 | 依据 |
+| --- | --- | --- |
+| 本地代理未启动 | 自动测试通过 | 使用刚释放的真实回环端口，configure 停止且两处夹具不变 |
+| SSH 失败与密码交互 | 自动测试通过；密码交互真实环境通过 | 覆盖退出码 255、取消、认证超时和未知错误；T0 已验证原生密码提示及取消 |
+| SCP 失败 | 自动测试通过；成功路径真实环境通过 | 覆盖上传中断、替换后摘要异常、暂存清理失败及残留路径报告；T0 已验证实际 SCP 传输 |
+| 远端端口冲突 | 自动测试通过 | 受控监听夹具停止配置，不换端口、不终止进程、不写配置 |
+| 两端端口不同 | 真实环境通过 | T4 使用本地 7897、远端 17890，实际请求与映射均通过 |
+| 重复与等价用户配置 | 自动测试通过；重复配置真实环境通过 | 无新增内容，首次恢复记录不变，remove 保留用户所有内容 |
+| 已知转发占用与无监听 | 自动测试通过；已知占用真实环境通过 | 正常端点无修改通过；无监听提示重连，不覆盖首次记录 |
+| 只有其他请求的代理日志 | 自动测试通过 | verify 成功仍明确要求人工请求和目标 PID 到代理端口的关联证据，不声明 M1 或验收完成 |
+| 本地写入失败 | 自动测试通过 | 远端未修改，本地原文保留，错误中的测试 Token 未输出 |
+| 远端写入失败或回复丢失 | 自动测试通过 | 已知写入状态自动撤销；状态未知时保留记录、路径和恢复指引，不谎称恢复 |
+| 用户修改后移除 | 自动测试通过 | SSH config 与 Remote settings 两种后续修改均保留，摘要不符时停止并保留记录 |
+| 秘密与日志 | 自动测试通过 | 外部输出和恢复记录均不含测试 Token、完整配置或原始环境 |
+
 ## T0 样本试验
 
 - 临时文件撤销演练：自动测试通过
@@ -113,7 +148,7 @@ node scripts/e2e.mjs remove --host <新测试机 alias>
 
 ## 失败用例与里程碑
 
-- 失败用例：未执行；T5 范围不在本任务内
+- 失败用例：T5 受控自动测试全部通过；真实密码、SCP 成功路径、两端端口映射与重复配置证据复用 T0/T4，未执行破坏性真实故障注入
 - T0：通过；实际 Codex 进程采用代理、用户请求经该路径成功、全部试验改动已安全撤销
-- M1：未通过；仍待 T3–T4
-- M2：未通过
+- M1：通过；T4 命令级真实 E2E 已取得实际进程代理字段、请求连接关联、新回复及安全撤销证据
+- M2：通过；M1 成立，T5 的 PRD 失败用例、恢复说明和运行说明均已完成，仅承诺上述实测支持范围

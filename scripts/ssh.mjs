@@ -277,7 +277,7 @@ export async function remoteRead(options, remoteSettings = DEFAULT_REMOTE_SETTIN
 
 const PREFLIGHT_SCRIPT = String.raw`
 set -eu
-for tool in sh bash curl base64 sha256sum mktemp mv cp rm rmdir chmod stat dirname basename find grep awk tr cut readlink date sleep; do
+for tool in sh bash curl base64 sha256sum mktemp mv cp rm rmdir chmod stat dirname basename find grep awk tr cut readlink date sleep id; do
   command -v "$tool" >/dev/null 2>&1 || { printf '__CODEX_E2E__\nmissing=%s\n' "$tool"; exit 44; }
 done
 listener_tool=
@@ -387,7 +387,7 @@ export function hasExpectedRemoteForward(effectiveText, remotePort, localPort) {
 export function classifyEndpoint({ listeners, hasExpectedForward, remotePort }) {
   const expected = `127.0.0.1:${remotePort}`;
   if (listeners.some((value) => value !== expected) || listeners.length > 1) {
-    return { status: 'fail', message: '远端端口存在非预期或非回环监听。', shouldProbeTarget: false };
+    return { status: 'fail', message: '远端端口存在非预期或非回环监听，请断开相关连接。', shouldProbeTarget: false };
   }
   if (listeners.length === 1 && !hasExpectedForward) {
     return { status: 'fail', message: '远端端口已被来源不明的监听占用。', shouldProbeTarget: false };
@@ -531,4 +531,129 @@ export async function inspectTarget(options, dependencies = {}) {
     checks.push({ layer: 'target-https', status: 'fail', message: safeFailureMessage(error, '目标 HTTPS 检查失败。') });
   }
   return { ok: checks.every((check) => check.status !== 'fail'), checks, snapshot };
+}
+
+const PROCESS_SCRIPT = String.raw`
+set -eu
+port=$1; requested=$2; needle=$3; pids=; unverified=0; requested_unverified=0
+set -- "$HOME"/.vscode-server/extensions/openai.chatgpt-*
+[ "$#" -eq 1 ] && [ -d "$1" ] || { printf '__CODEX_E2E__\nselection=unverified\n'; exit 46; }
+extension=$(readlink -f "$1")
+current_uid=$(id -u)
+for file in /proc/[0-9]*/cmdline; do
+  [ -r "$file" ] || continue
+  pid=$(printf '%s' "$file" | awk -F/ '{print $3}')
+  [ "$pid" = "$$" ] && continue
+  tr '\000' '\n' < "$file" 2>/dev/null | grep -qxF -- "$needle" || continue
+  owner=$(awk '/^Uid:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null || true)
+  executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  verified=0
+  if [ "$owner" = "$current_uid" ] && [ "$(basename "$executable")" = codex ]; then
+    case "$executable" in "$extension"/*) verified=1;; esac
+  fi
+  if [ "$verified" -eq 1 ]; then
+    pids="$pids $pid"
+  else
+    unverified=$((unverified + 1))
+    [ "$pid" = "$requested" ] && requested_unverified=1
+  fi
+done
+set -- $pids
+if [ "$requested" != "auto" ]; then
+  selected=; for pid do [ "$pid" = "$requested" ] && selected=$pid; done
+  if [ -z "$selected" ]; then
+    [ "$requested_unverified" -eq 1 ] && printf '__CODEX_E2E__\nselection=unverified\n' || printf '__CODEX_E2E__\nselection=missing\n'
+    exit 46
+  fi
+elif [ "$#" -eq 0 ]; then
+  [ "$unverified" -gt 0 ] && printf '__CODEX_E2E__\nselection=unverified\n' || printf '__CODEX_E2E__\nselection=none\n'
+  exit 46
+elif [ "$#" -eq 1 ]; then selected=$1
+else printf '__CODEX_E2E__\nselection=ambiguous\ncount=%s\n' "$#"; exit 46
+fi
+expected="http://127.0.0.1:$port"; http=missing; https=missing; lower=ok; bypass=ok
+while IFS='=' read -r key value; do
+  case "$key" in
+    HTTP_PROXY) [ "$value" = "$expected" ] && http=match || http=conflict;;
+    HTTPS_PROXY) [ "$value" = "$expected" ] && https=match || https=conflict;;
+    http_proxy|https_proxy) [ "$value" = "$expected" ] || lower=conflict;;
+    NO_PROXY|no_proxy) lowered=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]'); case "$lowered" in '*'|*openai.com*) bypass=conflict;; esac;;
+  esac
+done < <(tr '\000' '\n' < "/proc/$selected/environ")
+printf '__CODEX_E2E__\npid=%s\nidentity=match\nHTTP_PROXY=%s\nHTTPS_PROXY=%s\nlowercase=%s\nbypass=%s\n' "$selected" "$http" "$https" "$lower" "$bypass"
+`;
+
+function classifyProcessCheck(stdout) {
+  const marker = stdout.lastIndexOf(RESULT_MARKER);
+  const body = marker < 0 ? '' : stdout.slice(marker + RESULT_MARKER.length);
+  if (/^selection=none$/m.test(body)) {
+    return { status: 'unknown', message: '未找到真实 Codex app-server 进程；请在远端窗口打开 Codex 后重试。' };
+  }
+  if (/^selection=missing$/m.test(body)) {
+    return { status: 'unknown', message: '--pid 指定的进程不是当前 Codex app-server。' };
+  }
+  if (/^selection=unverified$/m.test(body)) {
+    return { status: 'unknown', message: 'Codex app-server 的可执行文件或用户归属无法确认。' };
+  }
+  const count = body.match(/^selection=ambiguous\ncount=(\d+)$/m)?.[1];
+  if (count) return { status: 'unknown', message: `找到 ${count} 个 Codex app-server 候选；请用 --pid 指定已确认的 PID。` };
+
+  const pid = body.match(/^pid=(\d+)$/m)?.[1];
+  const identity = body.match(/^identity=(match|unverified)$/m)?.[1] ?? 'unknown';
+  const statuses = Object.fromEntries(['HTTP_PROXY', 'HTTPS_PROXY', 'lowercase', 'bypass'].map((key) => [
+    key,
+    body.match(new RegExp(`^${key}=(match|ok|missing|conflict)$`, 'm'))?.[1] ?? 'unknown',
+  ]));
+  if (!pid) return { status: 'unknown', message: 'Codex 后端进程检查没有可用证据。' };
+  if (identity !== 'match') return { status: 'unknown', message: `PID ${pid} 的身份与归属证据不足。` };
+
+  const summary = `HTTP_PROXY=${statuses.HTTP_PROXY}，HTTPS_PROXY=${statuses.HTTPS_PROXY}，lowercase=${statuses.lowercase}，bypass=${statuses.bypass}`;
+  if (Object.values(statuses).includes('conflict')) {
+    return { status: 'fail', message: `PID ${pid} 的代理环境存在冲突：${summary}。` };
+  }
+  if (statuses.HTTP_PROXY !== 'match' || statuses.HTTPS_PROXY !== 'match' || statuses.lowercase !== 'ok' || statuses.bypass !== 'ok') {
+    return { status: 'unknown', message: `PID ${pid} 的代理环境证据不足：${summary}。` };
+  }
+  return { status: 'pass', message: `PID ${pid} 的代理字段匹配，无冲突绕过。` };
+}
+
+export async function verifyTarget(options, record, dependencies = {}) {
+  const operations = { inspectTarget, runSsh, ...dependencies };
+  const layers = ['local-proxy', 'ssh', 'remote-endpoint', 'target-https'];
+  const inspected = await operations.inspectTarget({
+    ...options,
+    localProxy: record.localProxy,
+    localPort: record.localPort,
+    remotePort: record.remotePort,
+    targetUrl: options.targetUrl ?? DEFAULT_TARGET_URL,
+  }, dependencies);
+  const checks = layers.map((layer) => inspected.checks.find((check) => check.layer === layer) ?? ({
+    layer,
+    status: 'unknown',
+    message: '前置检查没有返回该层证据。',
+  }));
+
+  if (checks.some((check) => check.status !== 'pass')) {
+    checks.push({ layer: 'codex-process', status: 'unknown', message: '前置检查未全部通过，未检查 Codex 进程。' });
+    return { ok: false, checks };
+  }
+
+  let processCheck;
+  try {
+    const stdout = await operations.runSsh(
+      { host: options.host, sshConfig: options.sshConfig },
+      PROCESS_SCRIPT,
+      [String(record.remotePort), String(options.pid ?? 'auto'), 'app-server'],
+      60_000,
+      'bash',
+      '检查 Codex 后端进程环境',
+      [46],
+    );
+    processCheck = classifyProcessCheck(stdout);
+  } catch (error) {
+    rethrowCancellation(error);
+    processCheck = { status: 'unknown', message: 'Codex 后端进程检查失败，没有可用证据。' };
+  }
+  checks.push({ layer: 'codex-process', ...processCheck });
+  return { ok: checks.every((check) => check.status === 'pass'), checks };
 }

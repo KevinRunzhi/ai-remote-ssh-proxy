@@ -266,6 +266,78 @@ test('远端写入使用受限本地文件、私有暂存、摘要复读并清�
   }
 });
 
+test('SCP 上传失败不替换目标并清理本地与远端暂存', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-scp-fail-'));
+  const stage = '/home/sample/.codex-proxy-e2e-scp-fail';
+  const remoteFile = `${stage}/settings upload.json`;
+  const encoded = (value) => Buffer.from(value).toString('base64');
+  const stagingStates = [];
+  const labels = [];
+  try {
+    await assert.rejects(() => writeRemoteSettings({
+      options: { host: 'dev-linux' },
+      remotePath: '/home/sample/settings.json',
+      expectedHash: 'missing',
+      text: '{}\n',
+      temporaryDirectory: directory,
+      onStaging: async (value) => stagingStates.push(value),
+    }, {
+      restrictDirectory: async () => {},
+      runScp: async () => { throw new Error('SCP upload failed'); },
+      runSsh: async (_options, _script, _args, _timeout, _shell, label) => {
+        labels.push(label);
+        if (label === '检查远端写入工具') return '__CODEX_CONFIG__\nready=1\n';
+        if (label === '创建远端私有暂存目录') {
+          return `__CODEX_CONFIG__\nstage=${encoded(stage)}\nfile=${encoded(remoteFile)}\n`;
+        }
+        if (label === '清理远端暂存目录') return '__CODEX_CONFIG__\nclean=1\n';
+        throw new Error(`unexpected label: ${label}`);
+      },
+    }), /SCP upload failed/);
+    assert.deepEqual(stagingStates, [stage, null]);
+    assert.doesNotMatch(labels.join('\n'), /写入 Remote settings/);
+    assert.deepEqual(await fs.readdir(directory), []);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('远端摘要异常或暂存清理失败均报告安全边界', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-remote-fail-'));
+  const stage = '/home/sample/.codex-proxy-e2e-cleanup-fail';
+  const remoteFile = `${stage}/settings upload.json`;
+  const encoded = (value) => Buffer.from(value).toString('base64');
+  const runCase = async ({ cleanupFails = false } = {}) => writeRemoteSettings({
+    options: { host: 'dev-linux' },
+    remotePath: '/home/sample/settings.json',
+    expectedHash: 'missing',
+    text: '{}\n',
+    temporaryDirectory: directory,
+  }, {
+    restrictDirectory: async () => {},
+    runScp: async () => {},
+    runSsh: async (_options, _script, _args, _timeout, _shell, label) => {
+      if (label === '检查远端写入工具') return '__CODEX_CONFIG__\nready=1\n';
+      if (label === '创建远端私有暂存目录') {
+        return `__CODEX_CONFIG__\nstage=${encoded(stage)}\nfile=${encoded(remoteFile)}\n`;
+      }
+      if (label === '写入 Remote settings') return 'wrong-hash\n';
+      if (label === '清理远端暂存目录') {
+        if (cleanupFails) throw new Error('cleanup failed');
+        return '__CODEX_CONFIG__\nclean=1\n';
+      }
+      throw new Error(`unexpected label: ${label}`);
+    },
+  });
+  try {
+    await assert.rejects(() => runCase(), /远端替换后复读摘要不匹配/);
+    await assert.rejects(() => runCase({ cleanupFails: true }), new RegExp(`远端暂存清理结果不明：${stage.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.deepEqual(await fs.readdir(directory), []);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('本地暂存写入失败会删除副本，删除失败时报告残留路径', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-upload-fail-'));
   const makeFileSystem = (failRemove = false) => ({

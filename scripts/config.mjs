@@ -231,22 +231,36 @@ export function prepareEdits(input) {
   };
 }
 
-export function restoreEdits({ sshText, settingsText, recovery }) {
-  if (sha256(sshText) !== recovery.ssh.afterHash || sha256(settingsText) !== recovery.settings.afterHash) {
-    fail('当前配置摘要与应用后状态不符；停止恢复以保留用户修改。');
+export function restoreSshEdit({ sshText, recovery }) {
+  if (sha256(sshText) !== recovery.afterHash) {
+    fail('当前 SSH config 摘要与应用后状态不符；停止恢复以保留用户修改。');
   }
   let restoredSsh = sshText;
-  if (recovery.ssh.owned) {
-    const snippet = recovery.ssh.snippet;
+  if (recovery.owned) {
+    const snippet = recovery.snippet;
     if (!snippet || restoredSsh.split(snippet).length !== 2) fail('SSH 工具片段无法唯一定位。');
     restoredSsh = restoredSsh.replace(snippet, '');
   }
-  const restoredSettings = undoSettings(settingsText, recovery.settings.inverseSteps);
-  if (sha256(restoredSsh) !== recovery.ssh.beforeHash) fail('SSH config 无法按记录精确恢复。');
-  if (recovery.settings.existed && sha256(restoredSettings) !== recovery.settings.beforeHash) {
+  if (sha256(restoredSsh) !== recovery.beforeHash) fail('SSH config 无法按记录精确恢复。');
+  return restoredSsh;
+}
+
+export function restoreSettingsEdit({ settingsText, recovery }) {
+  if (sha256(settingsText) !== recovery.afterHash) {
+    fail('当前 Remote settings 摘要与应用后状态不符；停止恢复以保留用户修改。');
+  }
+  const restoredSettings = undoSettings(settingsText, recovery.inverseSteps);
+  if (recovery.existed && sha256(restoredSettings) !== recovery.beforeHash) {
     fail('Remote settings 无法按记录精确恢复。');
   }
-  return { sshText: restoredSsh, settingsText: recovery.settings.existed ? restoredSettings : null };
+  return recovery.existed ? restoredSettings : null;
+}
+
+export function restoreEdits({ sshText, settingsText, recovery }) {
+  return {
+    sshText: restoreSshEdit({ sshText, recovery: recovery.ssh }),
+    settingsText: restoreSettingsEdit({ settingsText, recovery: recovery.settings }),
+  };
 }
 
 async function assertRegularFile(filePath, fileSystem = fs) {
