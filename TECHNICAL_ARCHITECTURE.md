@@ -1,5 +1,7 @@
 # 技术架构：首次真实环境端到端验证
 
+> 版本导航：本文保留 v0.1 的验证与实现背景。下一版方案见 [v0.2 技术架构：本地 VS Code 扩展与原生 SSH 交互](docs/TECHNICAL_ARCHITECTURE_V0.2.md)，其中 P0 候选路径尚未实测。
+
 > 依据：[首版 PRD](PRD.md)。状态：验证方案，尚未执行真实端到端测试。日期：2026-09-06。
 > 本文只设计打通首条路径所需的验证脚本，不定义正式发布架构，也不恢复旧规格。
 
@@ -9,9 +11,9 @@
 
 成功必须同时有三类证据：**隧道可达、实际 Codex 后端采用代理、真实请求通过这条代理路径完成**。远端终端里 curl 成功只能证明第一类。
 
-只记录这一组实测版本的结论。当前样本已有直接 SSH 密码登录成功的记录，但 Node 调用 SSH 时认证交互阻塞；端到端尚未通过，详见 `docs/E2E_RUN.md`。本次传输修订仍待实测。
+只记录这一组实测版本的结论。当前样本已完成 Node 调用 OpenSSH 的原生密码交互、配置、重连、实际 Codex 请求归因和安全撤销，端到端验证已经通过，详见 `docs/E2E_RUN.md`。
 
-先做针对该样本的最小可撤销试验：维护者脚本预览并修改本文的两处配置，用户重连、发起请求，确认进程采用代理且路径证据成立，再撤销试验改动。试验保留第 5 节的必要写入与恢复保护，但不等待完整命令交互、内部接口和测试套件。通过后再把已验证操作整理为三个命令；失败则停在当前假设，不先完成整套工具。
+项目先完成了针对该样本的最小可撤销试验：维护者脚本预览并修改本文的两处配置，用户重连、发起请求，确认进程采用代理且路径证据成立，再撤销试验改动。随后已将验证过的操作整理为 `configure`、`verify`、`remove` 三个命令，并补齐完整命令复验和失败验收。
 
 ## 2. 最小框架与依据
 
@@ -188,4 +190,4 @@ SCP 上传的完整配置仅作短期传输：本地暂存限制为当前用户�
 - [8] [curl 手册](https://curl.se/docs/manpage.html)：代理、绕过列表、超时和状态输出。
 - [9] [OpenSSH GatewayPorts](https://man.openbsd.org/sshd_config#GatewayPorts)：服务端绑定策略。
 
-Codex 本机静态证据：`%USERPROFILE%/.vscode/extensions/openai.chatgpt-26.818.41705-win32-x64/out/extension.js`，第 673 行，SHA-256 为 `ECBC2FC452DDE64F9BE4BCD93928A18BD091F2D7F23DCB6EF756B4C239C2747D`。可搜索 `getConfiguration("http")`、`HTTP_PROXY`、`Spawning codex app-server` 复查调用链；不要依赖压缩后的函数名。目标 Linux 包尚未检查。公开 main 分支资料会变化，实测时记录目标安装版本与相关证据。
+Codex 本机静态证据：`%USERPROFILE%/.vscode/extensions/openai.chatgpt-26.818.41705-win32-x64/out/extension.js`，第 673 行，SHA-256 为 `ECBC2FC452DDE64F9BE4BCD93928A18BD091F2D7F23DCB6EF756B4C239C2747D`。可搜索 `getConfiguration("http")`、`HTTP_PROXY`、`Spawning codex app-server` 复查调用链；不要依赖压缩后的函数名。目标 Linux 扩展 `openai.chatgpt-26.901.22334-linux-x64` 的对应代理启动调用链也已在真实环境检查通过。公开版本会变化，后续实测仍需记录目标安装版本与相关证据。

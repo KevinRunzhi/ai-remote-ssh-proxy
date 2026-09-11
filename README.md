@@ -66,4 +66,4 @@ node scripts/e2e.mjs remove --host dev-linux
 
 首版仅支持唯一、单 alias 的字面 `Host` 块，拒绝 `Include`、`Match`、链接文件、冲突转发和冲突代理字段。一次只允许一个未移除目标，不会自动换端口、停止用户进程或覆盖后续修改。
 
-安全边界见 [SECURITY.md](SECURITY.md)，实施顺序见 [SPEC.md](SPEC.md)，脱敏实测记录见 [docs/E2E_RUN.md](docs/E2E_RUN.md)。
+安全边界见 [SECURITY.md](SECURITY.md)，实施顺序见 [SPEC.md](SPEC.md)，脱敏实测记录见 [docs/E2E_RUN.md](docs/E2E_RUN.md)。后续开发开始前可先阅读 [项目阶段总结与开发基线](docs/PROJECT_STATUS.md)。
