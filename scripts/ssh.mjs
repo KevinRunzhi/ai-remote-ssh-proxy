@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
 import { TextDecoder } from 'node:util';
+import { createHash } from 'node:crypto';
 
 const SSH_READY_MARKER = '__CODEX_E2E_SSH_READY__';
 const RESULT_MARKER = '__CODEX_E2E__\n';
@@ -24,22 +25,29 @@ export function runProcess({
   args,
   timeoutMs = 20_000,
   stdio = ['pipe', 'pipe', 'pipe'],
+  env,
+  signal,
+  maxOutputBytes = 2 * 1024 * 1024,
 }) {
   if (typeof executable !== 'string' || !Array.isArray(args) || args.some((value) => typeof value !== 'string')) {
     return Promise.reject(new TypeError('外部进程必须使用可执行文件和字符串参数数组。'));
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, args, { shell: false, windowsHide: true, stdio });
+    if (signal?.aborted) { reject(new CancelledError('操作已取消。')); return; }
+    const child = spawn(executable, args, { shell: false, windowsHide: true, stdio, env });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
     let interrupted = false;
     let settled = false;
+    let outputBytes = 0;
+    let outputExceeded = false;
 
     const cleanup = () => {
       clearTimeout(timer);
       process.removeListener('SIGINT', onSigint);
+      signal?.removeEventListener('abort', onSigint);
     };
     const stop = () => {
       if (child.exitCode === null && child.signalCode === null) child.kill();
@@ -54,13 +62,22 @@ export function runProcess({
     }, timeoutMs);
 
     process.once('SIGINT', onSigint);
+    signal?.addEventListener('abort', onSigint, { once: true });
+    if (signal?.aborted) onSigint();
+    const collect = (chunk, stream) => {
+      if (outputExceeded) return;
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > maxOutputBytes) { outputExceeded = true; stdout = ''; stderr = ''; stop(); return; }
+      if (stream === 'stdout') stdout += chunk;
+      else stderr += chunk;
+    };
     if (child.stdout) {
       child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk) => { stdout += chunk; });
+      child.stdout.on('data', (chunk) => collect(chunk, 'stdout'));
     }
     if (child.stderr) {
       child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.stderr.on('data', (chunk) => collect(chunk, 'stderr'));
     }
     if (child.stdin) child.stdin.end();
     child.on('error', (error) => {
@@ -77,7 +94,7 @@ export function runProcess({
         reject(new CancelledError('操作已取消。'));
         return;
       }
-      resolve({ exitCode, stdout, stderr, timedOut });
+      resolve({ exitCode, stdout, stderr, timedOut, outputExceeded });
     });
   });
 }
@@ -88,25 +105,42 @@ export function openSshExecutables() {
   return { ssh: path.join(directory, 'ssh.exe'), scp: path.join(directory, 'scp.exe') };
 }
 
+function directConnectionArgs(options) {
+  if (options.inputMode === 'direct') {
+    if (typeof options.hostname !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(options.hostname)
+        || typeof options.username !== 'string' || !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(options.username)
+        || !Number.isInteger(options.sshPort) || options.sshPort < 1 || options.sshPort > 65535) fail('直接连接参数不合法。');
+  }
+  return options.inputMode === 'direct' ? ['-o', `HostName=${options.hostname}`, '-o', `User=${options.username}`, '-o', `Port=${options.sshPort}`] : [];
+}
+
 export function sshBaseArgs(options) {
   return [
-    '-F', options.sshConfig,
+    '-F', options.sshConfig ?? 'none',
     '-o', 'ClearAllForwardings=yes',
     '-o', 'ControlMaster=no',
     '-o', 'ControlPath=none',
+    ...directConnectionArgs(options),
   ];
 }
 
 export function runInteractiveProcess(executable, args, {
   stdoutMode = 'pipe', authenticationTimeoutMs = 120_000, operationTimeoutMs = 60_000,
   readyMarker = SSH_READY_MARKER, stepLabel = '执行远端操作', cancelProbe = false,
+  signal, notify, maxStdoutBytes = 2 * 1024 * 1024,
+  spawnProcess = spawn, terminal = process,
 } = {}) {
-  if (!process.stdin.isTTY || !process.stderr.isTTY) fail('当前不是交互式终端；请在 PowerShell 中运行。');
-  console.log(`⏳ ${stepLabel}：OpenSSH 可能要求密码；请在原生提示后输入，内容不回显也不会被 Node 读取。`);
+  if (!terminal.stdin.isTTY || !terminal.stderr.isTTY) fail('当前不是交互式终端；请在 PowerShell 中运行。');
+  if (signal?.aborted) throw new CancelledError('操作已取消，未启动子进程。');
+  const announce = (status, message) => {
+    if (notify) notify({ stage: 'ssh', status, message });
+    else console.log(message);
+  };
+  announce('waiting-user', `⏳ ${stepLabel}：OpenSSH 可能要求密码；请在原生提示后输入，内容不回显也不会被 Node 读取。`);
   if (cancelProbe) console.log('请在密码提示出现时按 Ctrl+C，不要输入密码。');
 
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, args, {
+    const child = spawnProcess(executable, args, {
       shell: false,
       windowsHide: true,
       stdio: ['inherit', stdoutMode, 'inherit'],
@@ -115,39 +149,62 @@ export function runInteractiveProcess(executable, args, {
     let authenticated = false;
     let timedOut = false;
     let cancelled = false;
+    let outputExceeded = false;
+    let stdoutBytes = 0;
+    let settled = false;
+    const stop = () => {
+      if (!settled && child.exitCode === null && child.signalCode === null) child.kill();
+    };
     let timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      stop();
     }, authenticationTimeoutMs);
 
     const onSigint = () => {
       cancelled = true;
-      child.kill();
+      stop();
     };
-    process.once('SIGINT', onSigint);
+    const cleanup = () => {
+      clearTimeout(timer);
+      terminal.removeListener('SIGINT', onSigint);
+      signal?.removeEventListener('abort', onSigint);
+    };
+    terminal.once('SIGINT', onSigint);
+    signal?.addEventListener('abort', onSigint, { once: true });
+    if (signal?.aborted) onSigint();
     if (stdoutMode === 'pipe') {
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk) => {
+        if (settled || outputExceeded) return;
+        stdoutBytes += Buffer.byteLength(chunk);
+        if (stdoutBytes > maxStdoutBytes) {
+          outputExceeded = true;
+          stdout = '';
+          stop();
+          return;
+        }
         stdout += chunk;
         if (!authenticated && new RegExp(`${escapeRegExp(readyMarker)}\\r?\\n`).test(stdout)) {
           authenticated = true;
           clearTimeout(timer);
           timer = setTimeout(() => {
             timedOut = true;
-            child.kill();
+            stop();
           }, operationTimeoutMs);
-          console.log(`✅ 认证成功，开始执行：${stepLabel}`);
+          announce('running', `✅ 认证成功，开始执行：${stepLabel}`);
         }
       });
     }
     child.on('error', (error) => {
-      clearTimeout(timer);
-      process.removeListener('SIGINT', onSigint);
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(error);
     });
     child.on('close', (exitCode, signal) => {
-      clearTimeout(timer);
-      process.removeListener('SIGINT', onSigint);
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve({
         exitCode,
         signal,
@@ -155,6 +212,7 @@ export function runInteractiveProcess(executable, args, {
         timedOut,
         authenticated,
         cancelled,
+        outputExceeded,
       });
     });
   });
@@ -181,26 +239,38 @@ export async function runSsh(
   acceptedExitCodes = [],
 ) {
   const { ssh } = openSshExecutables();
-  const args = ['-T', ...sshBaseArgs(options), options.host, remoteCommand(script, parameters, shell)];
-  const result = await runInteractiveProcess(ssh, args, { operationTimeoutMs, stepLabel });
+  const args = ['-T', ...sshBaseArgs(options), options.inputMode === 'direct' ? options.hostname : options.host, remoteCommand(script, parameters, shell)];
+  const result = await runInteractiveProcess(ssh, args, {
+    operationTimeoutMs, stepLabel, signal: options.signal, notify: options.notify,
+  });
+  if (result.outputExceeded) fail(`${stepLabel}输出超过限制；原始内容未展示。`);
   if (result.timedOut) fail(`${stepLabel}超时；${result.authenticated ? 'SSH 已认证，但远端操作未完成' : 'SSH 认证未完成'}。`);
   if (result.cancelled) throw new CancelledError(`${stepLabel}已取消；未继续执行。`);
   if (result.exitCode !== 0 && !acceptedExitCodes.includes(result.exitCode)) {
     fail(`${stepLabel}失败（退出码 ${result.exitCode ?? '未知'}；${result.authenticated ? 'SSH 已认证' : 'SSH 认证未完成'}）；原始输出未展示。`);
   }
-  if (result.exitCode === 0) console.log(`✅ 已完成：${stepLabel}`);
+  if (result.exitCode === 0) {
+    const message = `✅ 已完成：${stepLabel}`;
+    if (options.notify) options.notify({ stage: 'ssh', status: 'pass', message });
+    else console.log(message);
+  }
   return result.stdout;
 }
 
 export async function runScp(options, localFile, remoteFile, stepLabel) {
   const { scp } = openSshExecutables();
   const result = await runInteractiveProcess(scp, [
-    ...sshBaseArgs(options), '--', localFile, `${options.host}:${remoteFile}`,
-  ], { readyMarker: '__SCP_HAS_NO_READY_MARKER__', stepLabel });
+    ...sshBaseArgs(options), '--', localFile, `${options.inputMode === 'direct' ? options.hostname : options.host}:${remoteFile}`,
+  ], {
+    readyMarker: '__SCP_HAS_NO_READY_MARKER__', stepLabel,
+    authenticationTimeoutMs: 120_000, signal: options.signal, notify: options.notify,
+  });
+  if (result.outputExceeded) fail(`${stepLabel}输出超过限制。`);
   if (result.timedOut) fail(`${stepLabel}超时。`);
   if (result.cancelled) throw new CancelledError(`${stepLabel}已取消。`);
   if (result.exitCode !== 0) fail(`${stepLabel}失败（退出码 ${result.exitCode ?? '未知'}）。`);
-  console.log(`✅ 已完成：${stepLabel}`);
+  if (options.notify) options.notify({ stage: 'scp', status: 'pass', message: `✅ 已完成：${stepLabel}` });
+  else console.log(`✅ 已完成：${stepLabel}`);
 }
 
 export function classifyCurlResult(result) {
@@ -232,15 +302,17 @@ function curlArgs(proxy, output, targetUrl) {
   ];
 }
 
-export async function probeLocalProxy({ localProxy, localPort, targetUrl = DEFAULT_TARGET_URL }) {
+export async function probeLocalProxy({ localProxy, localPort, targetUrl = DEFAULT_TARGET_URL, signal, notify }) {
   const result = classifyCurlResult(await runProcess({
     executable: 'curl.exe',
     args: curlArgs(localProxy, 'NUL', targetUrl),
     timeoutMs: 20_000,
+    signal,
     stdio: ['ignore', 'pipe', 'pipe'],
   }));
   if (!result.ok) fail(`本地代理检查失败（curl 退出码 ${result.evidence.exitCode ?? '未知'}）；请确认 127.0.0.1:${localPort} 的无认证 HTTP 代理已启动。`);
-  console.log('✅ 本地代理：TLS 有效，目标返回预期 401。');
+  if (notify) notify({ stage: 'local-proxy', status: 'pass' });
+  else console.log('✅ 本地代理：TLS 有效，目标返回预期 401。');
 }
 
 const REMOTE_READ_SCRIPT = String.raw`
@@ -248,9 +320,15 @@ set -eu
 file=$1
 case "$file" in "~/"*) file="$HOME/$(printf '%s' "$file" | cut -c 3-)";; esac
 if [ -L "$file" ]; then exit 41; fi
+parent=$(dirname "$file")
+while [ "$parent" != / ]; do
+  [ ! -L "$parent" ] && [ -d "$parent" ] || exit 41
+  parent=$(dirname "$parent")
+done
 printf '__CODEX_E2E__\n'
 if [ ! -e "$file" ]; then printf 'exists=0\nhash=missing\nmode=600\ncontent=\n'; exit 0; fi
 if [ ! -f "$file" ]; then exit 41; fi
+[ "$(stat -c %s "$file")" -le 1048576 ] || exit 41
 printf 'exists=1\nhash=%s\nmode=%s\ncontent=' "$(sha256sum "$file" | awk '{print $1}')" "$(stat -c '%a' "$file")"
 base64 < "$file" | tr -d '\n'
 printf '\n'
@@ -261,18 +339,41 @@ export async function remoteRead(options, remoteSettings = DEFAULT_REMOTE_SETTIN
   const marker = stdout.lastIndexOf(RESULT_MARKER);
   if (marker < 0) fail('远端读取返回无法识别的结果。');
   const body = stdout.slice(marker + RESULT_MARKER.length);
-  const match = body.match(/^exists=([01])\nhash=([a-f0-9]+|missing)\nmode=([0-7]+)\ncontent=([^\n]*)/);
+  const match = body.match(/^exists=([01])\nhash=([a-f0-9]{64}|missing)\nmode=([0-7]{3})\ncontent=([A-Za-z0-9+/]*={0,2})\n$/);
   if (!match) fail('远端读取结果不完整。');
   const bytes = Buffer.from(match[4], 'base64');
+  if (bytes.length > 1024 * 1024 || bytes.toString('base64') !== match[4]
+      || (match[1] === '0' ? match[2] !== 'missing' || bytes.length !== 0 : createHash('sha256').update(bytes).digest('hex') !== match[2])) fail('远端读取摘要、大小或存在性不符。');
   let text = null;
   if (match[1] === '1') {
     try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
     } catch {
       fail('Remote settings 不是有效 UTF-8。');
     }
   }
+  if (text?.includes('\0')) fail('Remote settings 包含不受支持的编码。');
   return { exists: match[1] === '1', hash: match[2], mode: match[3], text };
+}
+
+// v0.3 以 VS Code 注册表确定有效包；卸载残留目录不参与选择。
+export function registeredCodex(text, { home, architecture }) {
+  if (typeof home !== 'string' || !home.startsWith('/') || /[\x00-\x1f\x7f]/.test(home)
+      || !['x86_64', 'aarch64'].includes(architecture)) fail('缺少 Codex 注册位置和平台依据。');
+  if (text === null) return null;
+  let entries;
+  try { entries = JSON.parse(text); } catch { fail('Codex 扩展注册元数据损坏；未展示正文。'); }
+  if (!Array.isArray(entries) || entries.some((item) => !item || typeof item !== 'object' || Array.isArray(item))) fail('Codex 扩展注册元数据不受支持。');
+  const found = entries.filter((item) => typeof item.identifier?.id === 'string' && item.identifier.id.toLowerCase() === 'openai.chatgpt');
+  if (found.length > 1) fail('Codex 存在多个有效注册记录，无法唯一确认。');
+  if (!found.length) return null;
+  const item = found[0], platform = architecture === 'x86_64' ? 'linux-x64' : 'linux-arm64';
+  if (typeof item.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(item.version)
+      || item.relativeLocation !== `openai.chatgpt-${item.version}-${platform}` || item.metadata?.targetPlatform !== platform
+      || item.location?.scheme !== 'file' || item.location?.path !== `${home}/.vscode-server/extensions/${item.relativeLocation}`) {
+    fail('Codex 有效注册包的平台或位置不受支持；未选择其他残留目录。');
+  }
+  return item.relativeLocation;
 }
 
 const PREFLIGHT_SCRIPT = String.raw`
@@ -286,14 +387,25 @@ for candidate in ss netstat; do
 done
 if [ -z "$listener_tool" ] && [ -r /proc/net/tcp ]; then listener_tool=proc; fi
 [ -n "$listener_tool" ] || { printf '__CODEX_E2E__\nmissing=socket-inspection\n'; exit 44; }
-set -- "$HOME"/.vscode-server/extensions/openai.chatgpt-*
+selected=$1; registry_hash=$2
+if [ -n "$selected" ]; then
+  [ "$(sha256sum "$HOME/.vscode-server/extensions/extensions.json" | cut -d ' ' -f 1)" = "$registry_hash" ] || { printf '__CODEX_E2E__\nregistry=missing\n'; exit 45; }
+  set -- "$HOME/.vscode-server/extensions/$selected"
+else
+  set -- "$HOME"/.vscode-server/extensions/openai.chatgpt-*
+fi
 count=0
 extension=
 for candidate do [ -d "$candidate" ] || continue; count=$((count + 1)); extension=$candidate; done
 printf '__CODEX_E2E__\n'
 if [ "$count" -ne 1 ]; then printf 'extensions=%s\n' "$count"; exit 45; fi
+if [ -n "$selected" ]; then
+  current="$extension"
+  while [ "$current" != / ]; do [ -d "$current" ] && [ ! -L "$current" ] || exit 45; current=$(dirname "$current"); done
+fi
 entry="$extension/out/extension.js"
-[ -f "$entry" ] || { printf 'entry=missing\n'; exit 45; }
+if [ -n "$selected" ]; then [ -d "$extension/out" ] && [ ! -L "$extension/out" ] || exit 45; fi
+[ -f "$entry" ] && [ ! -L "$entry" ] || { printf 'entry=missing\n'; exit 45; }
 grep -F 'getConfiguration("http")' "$entry" >/dev/null || { printf 'http_config=missing\n'; exit 45; }
 grep -F 'HTTP_PROXY' "$entry" >/dev/null || { printf 'http_proxy=missing\n'; exit 45; }
 grep -F 'HTTPS_PROXY' "$entry" >/dev/null || { printf 'https_proxy=missing\n'; exit 45; }
@@ -308,7 +420,7 @@ function parsePreflight(stdout) {
   if (missing) fail(`远端缺少必需工具：${missing}。已停止且未进行配置写入。`);
   const extensionCount = body.match(/^extensions=(\d+)$/m)?.[1];
   if (extensionCount) fail(`远端 Codex 扩展候选数为 ${extensionCount}，无法唯一确认。`);
-  const failedEvidence = body.match(/^(entry|http_config|http_proxy|https_proxy|app_server)=missing$/m)?.[1];
+  const failedEvidence = body.match(/^(entry|http_config|http_proxy|https_proxy|app_server|registry)=missing$/m)?.[1];
   if (failedEvidence) fail(`远端 Codex 扩展调用链证据缺失：${failedEvidence}。`);
   if (!/static_chain=match/.test(body)) fail('远端前置检查返回无法识别的脱敏结果。');
   const version = body.match(/^extension=(.+)$/m)?.[1] ?? '未知版本';
@@ -317,11 +429,23 @@ function parsePreflight(stdout) {
   return { version, listenerTool };
 }
 
-export async function preflightRemote(options) {
-  const stdout = await runSsh(options, PREFLIGHT_SCRIPT, [], 60_000, 'sh', '检查远端工具与 Codex 扩展', [44, 45]);
+export async function preflightRemote(options, dependencies = {}) {
+  let selected = '', registryHash = '';
+  if (options.codexHome !== undefined) {
+    // 先验证路径形态，禁止将任意调用参数用作远端读取路径。
+    registeredCodex(null, { home: options.codexHome, architecture: options.codexArchitecture });
+    const registry = await (dependencies.remoteRead ?? remoteRead)(options, `${options.codexHome}/.vscode-server/extensions/extensions.json`);
+    selected = registeredCodex(registry.text, { home: options.codexHome, architecture: options.codexArchitecture });
+    if (selected === null) return { version: null, listenerTool: null, registration: 'missing' };
+    registryHash = registry.hash;
+    if (!/^[a-f0-9]{64}$/.test(registryHash ?? '')) fail('Codex 注册元数据缺少摘要。');
+  }
+  const stdout = await (dependencies.runSsh ?? runSsh)(options, PREFLIGHT_SCRIPT, [selected, registryHash], 60_000, 'sh', '检查远端工具与 Codex 扩展', [44, 45]);
   const result = parsePreflight(stdout);
-  console.log(`✅ SSH 与远端工具：可用；监听检查使用 ${result.listenerTool}；远端扩展 ${result.version} 的静态调用链匹配。`);
-  return result;
+  if (selected && result.version !== selected) fail('Codex 调用链与有效注册包不一致。');
+  if (options.notify) options.notify({ stage: 'codex', status: 'pass' });
+  else console.log(`✅ SSH 与远端工具：可用；监听检查使用 ${result.listenerTool}；远端扩展 ${result.version} 的静态调用链匹配。`);
+  return { ...result, ...(selected ? { registryHash } : {}) };
 }
 
 const PORT_SCRIPT = String.raw`
@@ -359,15 +483,40 @@ export async function remoteListeners(options, listenerTool, remotePort = 17890,
   return listeners;
 }
 
-export async function sshEffective(options) {
-  const result = await runProcess({
-    executable: openSshExecutables().ssh,
-    args: ['-G', '-F', options.sshConfig, options.host],
+export async function sshEffective(options, dependencies = {}) {
+  const result = await (dependencies.runProcess ?? runProcess)({
+    executable: dependencies.sshExecutable ?? openSshExecutables().ssh,
+    // -G 不建立网络连接；此处保留实际转发项以便比较有效配置。
+    args: ['-G', '-F', options.sshConfig ?? 'none', ...directConnectionArgs(options), options.inputMode === 'direct' ? options.hostname : options.host],
     timeoutMs: 10_000,
     stdio: ['ignore', 'pipe', 'pipe'],
+    signal: options.signal,
   });
-  if (result.exitCode !== 0 || result.timedOut) fail('ssh -G 无法解析目标配置。');
+  if (result.exitCode !== 0 || result.timedOut || result.outputExceeded) fail('ssh -G 无法解析目标配置。');
   return result.stdout.replace(/\r\n/g, '\n');
+}
+
+export function effectiveConnection(effectiveText) {
+  const value = {};
+  for (const line of effectiveText.split('\n')) {
+    const match = line.match(/^(hostname|user|port) (\S+)$/);
+    if (!match) continue;
+    if (Object.hasOwn(value, match[1])) fail('ssh -G 连接字段重复。');
+    value[match[1]] = match[2];
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(value.hostname ?? '')
+      || !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(value.user ?? '')
+      || !/^\d+$/.test(value.port ?? '') || Number(value.port) < 1 || Number(value.port) > 65535) fail('有效 SSH 连接字段不受支持。');
+  return { hostname: value.hostname, username: value.user, sshPort: Number(value.port) };
+}
+
+export function assertEffectiveForwardChange(before, after, remotePort, localPort) {
+  const beforeLines = before.replace(/\r\n/g, '\n').trimEnd().split('\n');
+  const afterLines = after.replace(/\r\n/g, '\n').trimEnd().split('\n');
+  const index = afterLines.findIndex((line) => hasExpectedRemoteForward(line, remotePort, localPort));
+  if (index < 0) fail('ssh -G 未确认获准的转发。');
+  afterLines.splice(index, 1);
+  if (beforeLines.join('\n') !== afterLines.join('\n')) fail('除获准转发外，有效 SSH 配置还有其他变化；停止写入。');
 }
 
 function normalizeEndpoint(value) {
@@ -475,7 +624,7 @@ export async function inspectTarget(options, dependencies = {}) {
     probeRemoteTarget,
     ...dependencies,
   };
-  const transportOptions = { host, sshConfig };
+  const transportOptions = { host, sshConfig, signal: options.signal, notify: options.notify };
   const checks = [];
   const snapshot = { sshEffective: null, remoteSettings: null, listenerTool: null, listeners: [] };
 
@@ -484,6 +633,7 @@ export async function inspectTarget(options, dependencies = {}) {
       executable: 'curl.exe',
       args: curlArgs(localProxy, 'NUL', targetUrl),
       timeoutMs: 20_000,
+      signal: options.signal,
       stdio: ['ignore', 'pipe', 'pipe'],
     }));
     checks.push({ layer: 'local-proxy', status: localResult.ok ? 'pass' : 'fail', message: localResult.message });
@@ -497,7 +647,7 @@ export async function inspectTarget(options, dependencies = {}) {
     const preflight = await operations.preflightRemote(transportOptions);
     snapshot.listenerTool = preflight.listenerTool;
     snapshot.remoteSettings = await operations.remoteRead(transportOptions, remoteSettings);
-    checks.push({ layer: 'ssh', status: 'pass', message: `SSH 与远端工具可用；Codex 扩展 ${preflight.version} 调用链匹配。` });
+    checks.push({ layer: 'ssh', status: 'pass', message: preflight.version ? `SSH 与远端工具可用；Codex 扩展 ${preflight.version} 调用链匹配。` : 'SSH 与 Linux 基础环境检查通过。' });
   } catch (error) {
     rethrowCancellation(error);
     checks.push({ layer: 'ssh', status: 'fail', message: safeFailureMessage(error, 'SSH 或远端只读检查失败。') });
@@ -535,8 +685,15 @@ export async function inspectTarget(options, dependencies = {}) {
 
 const PROCESS_SCRIPT = String.raw`
 set -eu
-port=$1; requested=$2; needle=$3; pids=; unverified=0; requested_unverified=0
-set -- "$HOME"/.vscode-server/extensions/openai.chatgpt-*
+port=$1; requested=$2; needle=$3; registered=$4; registry_hash=$5; pids=; unverified=0; requested_unverified=0
+if [ -n "$registered" ]; then
+  [ "$(sha256sum "$HOME/.vscode-server/extensions/extensions.json" | cut -d ' ' -f 1)" = "$registry_hash" ] || { printf '__CODEX_E2E__\nselection=unverified\n'; exit 46; }
+  set -- "$HOME/.vscode-server/extensions/$registered"
+  current=$1
+  while [ "$current" != / ]; do [ -d "$current" ] && [ ! -L "$current" ] || { printf '__CODEX_E2E__\nselection=unverified\n'; exit 46; }; current=$(dirname "$current"); done
+else
+  set -- "$HOME"/.vscode-server/extensions/openai.chatgpt-*
+fi
 [ "$#" -eq 1 ] && [ -d "$1" ] || { printf '__CODEX_E2E__\nselection=unverified\n'; exit 46; }
 extension=$(readlink -f "$1")
 current_uid=$(id -u)
@@ -618,6 +775,8 @@ function classifyProcessCheck(stdout) {
 }
 
 export async function verifyTarget(options, record, dependencies = {}) {
+  if (options.codexExtension !== undefined && (!/^openai\.chatgpt-\d+\.\d+\.\d+-linux-(x64|arm64)$/.test(options.codexExtension)
+      || !/^[a-f0-9]{64}$/.test(options.codexRegistryHash ?? ''))) fail('缺少有效 Codex 注册包和摘要。');
   const operations = { inspectTarget, runSsh, ...dependencies };
   const layers = ['local-proxy', 'ssh', 'remote-endpoint', 'target-https'];
   const inspected = await operations.inspectTarget({
@@ -641,9 +800,9 @@ export async function verifyTarget(options, record, dependencies = {}) {
   let processCheck;
   try {
     const stdout = await operations.runSsh(
-      { host: options.host, sshConfig: options.sshConfig },
+      { host: options.host, sshConfig: options.sshConfig, signal: options.signal, notify: options.notify },
       PROCESS_SCRIPT,
-      [String(record.remotePort), String(options.pid ?? 'auto'), 'app-server'],
+      [String(record.remotePort), String(options.pid ?? 'auto'), 'app-server', options.codexExtension ?? '', options.codexRegistryHash ?? ''],
       60_000,
       'bash',
       '检查 Codex 后端进程环境',

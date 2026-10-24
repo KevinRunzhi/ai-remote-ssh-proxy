@@ -3,12 +3,12 @@ import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { alias as validateAlias, hostname as validateHostname, username as validateUsername, port as validatePort } from './input.mjs';
 
-import { applyEdits as applyJsoncEdits, modify, parseTree } from 'jsonc-parser';
+import { applyEdits as applyJsoncEdits, parseTree } from 'jsonc-parser';
 
 const BEGIN_MARKER = '# BEGIN codex-proxy-e2e';
 const END_MARKER = '# END codex-proxy-e2e';
-const SETTINGS = ['http.useLocalProxyConfiguration', 'http.proxy'];
 
 export class ConfigError extends Error {}
 
@@ -135,25 +135,22 @@ function rootPropertyMap(root) {
 
 function parseSettings(text) {
   const errors = [];
-  const root = parseTree(text, errors, { allowTrailingComma: true, disallowComments: false });
+  const root = parseTree(text.startsWith('\uFEFF') ? text.slice(1) : text, errors, { allowTrailingComma: true, disallowComments: false });
   if (errors.length || root?.type !== 'object') fail('Remote settings 不是可安全局部编辑的 JSONC 对象。');
   const properties = rootPropertyMap(root);
-  for (const key of SETTINGS) {
-    if ((properties.get(key)?.length ?? 0) > 1) fail(`Remote settings 中 ${key} 重复，停止修改。`);
-  }
+  const checkDuplicates = (node) => {
+    if (node.type === 'object') {
+      const keys = new Set();
+      for (const property of node.children ?? []) {
+        const key = property.children[0].value;
+        if (keys.has(key)) fail('Remote settings 含重复键，停止修改。');
+        keys.add(key);
+      }
+    }
+    for (const child of node.children ?? []) checkDuplicates(child);
+  };
+  checkDuplicates(root);
   return properties;
-}
-
-function insertionInverse(before, after) {
-  let prefix = 0;
-  while (prefix < before.length && before[prefix] === after[prefix]) prefix += 1;
-  let suffix = 0;
-  while (
-    suffix < before.length - prefix
-    && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
-  ) suffix += 1;
-  if (prefix + suffix !== before.length) fail('JSONC 编辑不是纯插入，无法保存最小恢复信息。');
-  return { offset: prefix, length: after.length - before.length, content: '' };
 }
 
 function prepareSettingsEdit(originalText, remotePort) {
@@ -178,10 +175,16 @@ function prepareSettingsEdit(originalText, remotePort) {
       properties[key] = { owned: false, original: 'equivalent' };
       continue;
     }
-    const edits = modify(text, [key], value, { formattingOptions: formattingOptions(text) });
-    if (edits.length !== 1) fail('当前 JSONC 布局超出可安全恢复范围。');
-    const next = applyJsoncEdits(text, edits);
-    inverseSteps.push(insertionInverse(text, next));
+    const bomLength = text.startsWith('\uFEFF') ? 1 : 0;
+    const root = parseTree(text.slice(bomLength), [], { allowTrailingComma: true, disallowComments: false });
+    const format = formattingOptions(text);
+    const indent = format.insertSpaces ? ' '.repeat(format.tabSize) : '\t';
+    // 只在对象开头插入。旧字符一个也不改，逆操作无需保存可能含秘密的旧行。
+    const offset = root.offset + bomLength + 1;
+    const insertion = `${format.eol}${indent}${JSON.stringify(key)}: ${JSON.stringify(value)}${root.children?.length ? ',' : ''}${format.eol}`;
+    const next = applyJsoncEdits(text, [{ offset, length: 0, content: insertion }]);
+    parseSettings(next);
+    inverseSteps.push({ offset, length: insertion.length, content: '' });
     properties[key] = { owned: true, original: 'missing' };
     text = next;
   }
@@ -261,6 +264,142 @@ export function restoreEdits({ sshText, settingsText, recovery }) {
     sshText: restoreSshEdit({ sshText, recovery: recovery.ssh }),
     settingsText: restoreSettingsEdit({ settingsText, recovery: recovery.settings }),
   };
+}
+
+// v0.3 纯计划：连接与代理分别拥有恢复依据；不访问文件或外部进程。
+const V3_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+function planId(value) { if (typeof value !== 'string' || !V3_ID.test(value)) fail('配置归属标识无效。'); return value; }
+function checkedText(text) {
+  if (text !== null && (typeof text !== 'string' || Buffer.byteLength(text) > 1024 * 1024 || /\u0000/.test(text))) fail('配置文本类型、编码或大小不受支持。');
+  return text;
+}
+export function contentSnapshot(text) {
+  checkedText(text);
+  return { exists: text !== null, sha256: text === null ? null : sha256(text) };
+}
+function resourcePlan(kind, filePath, before, after, details) {
+  checkedText(after);
+  return { kind, path: filePath, text: after, changed: before !== after,
+    expectedBefore: contentSnapshot(before), expectedAfter: contentSnapshot(after), ...details };
+}
+function sshLayout(text, selectedAlias) {
+  checkedText(text);
+  const source = text ?? '';
+  if (/^\s*(?:Include|Match)(?:\s|=)/im.test(source)) fail('SSH config 含 Include 或 Match，停止修改。');
+  const lines = []; let offset = 0;
+  for (const raw of splitLines(source)) {
+    const bom = offset === 0 && raw.startsWith('\uFEFF') ? 1 : 0;
+    lines.push({ raw, offset: offset + bom, body: raw.slice(bom).replace(/[\r\n]+$/, '') }); offset += raw.length;
+  }
+  const stack = [], seen = new Set();
+  for (const line of lines) {
+    if (!/# (?:BEGIN|END) codex-(?:remote-|proxy-e2e)/.test(line.body)) continue;
+    const marker = line.body.trim().match(/^# (BEGIN|END) (codex-proxy-e2e|codex-remote-(?:connection|forward) [a-f0-9-]+(?: [a-f0-9-]+)?)$/);
+    if (!marker) fail('SSH 工具标记不完整。');
+    if (marker[2].startsWith('codex-remote-')) {
+      const [kind, target, cycle] = marker[2].split(' ');
+      planId(target);
+      if (kind === 'codex-remote-forward') planId(cycle);
+      else if (cycle !== undefined) fail('SSH 工具标记无效。');
+    }
+    if (marker[1] === 'BEGIN') {
+      if (seen.has(marker[2])) fail('SSH 工具标记重复。');
+      seen.add(marker[2]); stack.push(marker[2]);
+    } else if (stack.pop() !== marker[2]) fail('SSH 工具标记顺序不完整。');
+  }
+  if (stack.length) fail('SSH 工具标记不完整。');
+  const hosts = [];
+  for (let index = 0; index < lines.length; index++) {
+    const body = lines[index].body;
+    if (/^\s*Host\s*=/i.test(body)) fail('SSH Host 布局不受支持。');
+    const match = body.match(/^\s*Host\s+([^#]+?)(?:\s*#.*)?$/i);
+    if (!match) continue;
+    if (/["']/.test(match[1])) fail('SSH Host 引号布局不受支持。');
+    hosts.push({ line: index, aliases: match[1].trim().split(/\s+/), offset: lines[index].offset });
+  }
+  const selected = hosts.filter((host) => host.aliases.some((entry) => entry.toLowerCase() === selectedAlias.toLowerCase()));
+  if (selected.length > 1 || selected[0]?.aliases.length > 1) fail('目标必须位于唯一、单 alias 的字面 Host 块。');
+  const host = selected[0] ?? null;
+  const index = hosts.indexOf(host);
+  return { source, lines, hosts, host, end: host ? hosts[index + 1]?.offset ?? source.length : null,
+    eol: source.includes('\r\n') ? '\r\n' : '\n' };
+}
+
+export function planConnection({ sshText, filePath, alias, hostname, username, sshPort = 22, targetId, reuse = false }) {
+  validateAlias(alias); planId(targetId);
+  const layout = sshLayout(sshText, alias);
+  if (reuse) {
+    if (!layout.host) fail('已有 alias 不存在。');
+    return resourcePlan('connection', filePath, sshText, sshText, { owned: false, preview: [],
+      firstRecovery: { owned: false, existed: true, beforeHash: sha256(sshText), afterHash: sha256(sshText), snippet: '' } });
+  }
+  if (layout.host) fail('新连接 alias 已占用，请生成另一个 alias。');
+  validateHostname(hostname); validateUsername(username); validatePort(sshPort, 1);
+  const insertion = layout.hosts[0]?.offset ?? layout.source.length;
+  const prefix = layout.source.slice(0, insertion);
+  const eol = layout.eol;
+  const leading = prefix.length && !/[\r\n\uFEFF]$/.test(prefix) ? eol : '';
+  const snippet = `${leading}# BEGIN codex-remote-connection ${targetId}${eol}Host ${alias}${eol}    HostName ${hostname}${eol}    User ${username}${eol}    Port ${sshPort}${eol}# END codex-remote-connection ${targetId}${eol}`;
+  const after = prefix + snippet + layout.source.slice(insertion);
+  return resourcePlan('connection', filePath, sshText, after, { owned: true, preview: [snippet.trim()],
+    firstRecovery: { owned: true, existed: sshText !== null, beforeHash: sshText === null ? null : sha256(sshText), afterHash: sha256(after), snippet } });
+}
+
+export function planForwarding({ sshText, filePath, alias, localPort, remotePort, targetId, cycleId }) {
+  validateAlias(alias); validatePort(localPort); validatePort(remotePort); planId(targetId); planId(cycleId);
+  const layout = sshLayout(sshText, alias);
+  if (!layout.host) fail('连接 alias 尚未建立，不能配置转发。');
+  const targetLines = layout.lines.filter((line) => line.offset > layout.host.offset && line.offset < layout.end);
+  const globalLines = layout.lines.filter((line) => line.offset < layout.hosts[0].offset);
+  let equivalent = false;
+  for (const line of [...globalLines, ...targetLines]) {
+    const match = line.body.match(/^\s*RemoteForward\s+(\S+)\s+(\S+)(?:\s+#.*)?$/i);
+    if (!match) continue;
+    if (forwardedPort(match[1]) !== String(remotePort)) continue;
+    if (loopbackPort(match[1]) !== String(remotePort) || loopbackPort(match[2]) !== String(localPort)) fail('远端端口已有不同或非回环转发映射。');
+    equivalent = true;
+  }
+  const label = `codex-remote-forward ${targetId} ${cycleId}`;
+  if (layout.source.includes(`# BEGIN ${label}`)) fail('当前周期已有标记，必须先按写入意图核对，不能取得新所有权。');
+  if (equivalent) return resourcePlan('forwarding', filePath, sshText, sshText, { owned: false, preview: [],
+    firstRecovery: { owned: false, existed: true, beforeHash: sha256(sshText), afterHash: sha256(sshText), snippet: '' } });
+  const hostLine = layout.lines[layout.host.line];
+  const insertion = hostLine.offset + hostLine.raw.length - (hostLine.raw.startsWith('\uFEFF') ? 1 : 0);
+  const before = layout.source.slice(0, insertion);
+  const leading = /[\r\n]$/.test(before) ? '' : layout.eol;
+  const snippet = `${leading}    # BEGIN ${label}${layout.eol}    RemoteForward 127.0.0.1:${remotePort} 127.0.0.1:${localPort}${layout.eol}    # END ${label}${layout.eol}`;
+  const after = before + snippet + layout.source.slice(insertion);
+  return resourcePlan('forwarding', filePath, sshText, after, { owned: true, preview: [snippet.trim()],
+    firstRecovery: { owned: true, existed: true, beforeHash: sha256(sshText), afterHash: sha256(after), snippet } });
+}
+
+export function planSettings({ settingsText, filePath, remotePort }) {
+  checkedText(settingsText); validatePort(remotePort);
+  const prepared = prepareSettingsEdit(settingsText, remotePort);
+  return resourcePlan('settings', filePath, settingsText, prepared.text, { owned: prepared.changed,
+    preview: [...(!prepared.changed ? ['复用已有等价代理字段，不改写文件，也不取得移除所有权'] : []),
+      'http.useLocalProxyConfiguration = false', `http.proxy = http://127.0.0.1:${remotePort}`],
+    firstRecovery: { owned: prepared.changed, existed: prepared.existed, properties: prepared.properties,
+      inverseSteps: prepared.inverseSteps, beforeHash: settingsText === null ? null : sha256(settingsText), afterHash: sha256(prepared.text) } });
+}
+
+export function planResourceRestore({ kind, text, filePath, firstRecovery }) {
+  checkedText(text);
+  const recovery = firstRecovery;
+  if (!recovery || typeof recovery.owned !== 'boolean') fail('缺少资源恢复依据。');
+  if (!recovery.owned) return resourcePlan(kind, filePath, text, text, { owned: false, preview: ['保留用户原有配置'] });
+  if (text === null || sha256(text) !== recovery.afterHash) fail('当前摘要与应用后状态不符；保留用户修改。');
+  let after;
+  if (kind === 'settings') after = restoreSettingsEdit({ settingsText: text, recovery });
+  else {
+    if (!['connection', 'forwarding'].includes(kind)) fail('未知资源类型。');
+    after = restoreSshEdit({ sshText: text, recovery: recovery.existed ? recovery : { ...recovery, beforeHash: sha256('') } });
+    if (!recovery.existed) {
+      if (after !== '') fail('原本不存在的 SSH config 含其他内容，停止删除。');
+      after = null;
+    }
+  }
+  return resourcePlan(kind, filePath, text, after, { owned: true, preview: [kind === 'settings' ? '恢复工具添加的代理字段' : `移除工具添加的 ${kind} 片段`] });
 }
 
 async function assertRegularFile(filePath, fileSystem = fs) {

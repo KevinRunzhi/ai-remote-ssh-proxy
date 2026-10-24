@@ -1,5 +1,7 @@
 # Windows 远程 Codex：Spec 与实施计划
 
+> 版本导航：本文保留 v0.1 历史实施记录。**当前开发执行依据为 [v0.3 Spec](docs/SPEC_V0.3.md)**，对应 [v0.3 PRD](docs/PRD_V0.3.md)与[技术架构](docs/TECHNICAL_ARCHITECTURE_V0.3.md)；新版任务尚待执行。
+
 > 状态：T0–T5 已完成，M2 首版验收已通过。依据：[PRD](PRD.md)、[技术架构](TECHNICAL_ARCHITECTURE.md)、[安全边界](SECURITY.md)。
 > 完成当前任务的检查后再进入下一项；执行状态以 `docs/E2E_RUN.md` 的实际证据为准。未勾选项不代表现有代码完全不存在。
 

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 
 import {
   CancelledError,
@@ -11,9 +13,71 @@ import {
   inspectTarget,
   remoteCommand,
   runProcess,
+  runInteractiveProcess,
   sshBaseArgs,
+  sshEffective,
+  effectiveConnection,
+  assertEffectiveForwardChange,
   verifyTarget,
 } from '../scripts/ssh.mjs';
+
+function interactiveFixture(t) {
+  const terminal = new EventEmitter();
+  terminal.stdin = { isTTY: true }; terminal.stderr = { isTTY: true };
+  const child = new EventEmitter();
+  child.exitCode = null; child.signalCode = null; child.stdout = new PassThrough();
+  let kills = 0;
+  child.kill = () => { kills++; setImmediate(() => { child.signalCode = 'SIGTERM'; child.emit('close', null, 'SIGTERM'); }); };
+  const events = [];
+  const options = { terminal, notify: (event) => events.push(event), spawnProcess: (_exe, _args, opts) => {
+    assert.equal(opts.shell, false);
+    assert.deepEqual(opts.stdio, ['inherit', 'pipe', 'inherit']);
+    return child;
+  } };
+  t.after(() => child.stdout.destroy());
+  return { terminal, child, events, options, kills: () => kills };
+}
+
+test('原生传输读取就绪标记并清理监听，不采集 stdin/stderr', async (t) => {
+  const { terminal, child, events, options } = interactiveFixture(t);
+  const result = runInteractiveProcess('ssh.exe', ['sample'], options);
+  child.stdout.write('__CODEX_E2E_SSH_RE');
+  child.stdout.write('ADY__\r\nresult\n');
+  child.exitCode = 0; child.emit('close', 0, null);
+  const output = await result;
+  assert.equal(output.authenticated, true);
+  assert.equal(output.stdout, 'result\n');
+  assert.equal(terminal.listenerCount('SIGINT'), 0);
+  assert.deepEqual(events.map((event) => event.status), ['waiting-user', 'running']);
+});
+
+test('已取消信号不启动进程，活动取消等子进程 close 后返回', async (t) => {
+  const { child, options, kills, terminal } = interactiveFixture(t);
+  const aborted = new AbortController(); aborted.abort();
+  assert.throws(() => runInteractiveProcess('ssh.exe', [], { ...options, signal: aborted.signal }), CancelledError);
+  const controller = new AbortController();
+  let complete = false;
+  const pending = runInteractiveProcess('ssh.exe', [], { ...options, signal: controller.signal }).then((value) => { complete = true; return value; });
+  controller.abort();
+  assert.equal(complete, false);
+  const value = await pending;
+  assert.equal(value.cancelled, true); assert.equal(kills(), 1);
+  assert.equal(terminal.listenerCount('SIGINT'), 0);
+  child.emit('error', new Error('late event'));
+});
+
+test('stdout 超限终止子进程且丢弃正文，超时也清理监听', async (t) => {
+  const { options, child, terminal } = interactiveFixture(t);
+  const pending = runInteractiveProcess('ssh.exe', [], { ...options, maxStdoutBytes: 8 });
+  child.stdout.write('TEST_SECRET_TOO_LARGE');
+  const value = await pending;
+  assert.equal(value.outputExceeded, true); assert.equal(value.stdout, '');
+  assert.equal(terminal.listenerCount('SIGINT'), 0);
+  const other = interactiveFixture(t);
+  const timed = await runInteractiveProcess('ssh.exe', [], { ...other.options, authenticationTimeoutMs: 5 });
+  assert.equal(timed.timedOut, true);
+  assert.equal(other.terminal.listenerCount('SIGINT'), 0);
+});
 
 const PASSED_VERIFY_CHECKS = [
   { layer: 'local-proxy', status: 'pass', message: 'local ok' },
@@ -49,11 +113,19 @@ test('runProcess 使用参数数组且不经过 shell', async () => {
   assert.equal(result.timedOut, false);
 });
 
+test('非交互进程输出有容量边界，预先取消不启动可执行文件', async () => {
+  const result = await runProcess({ executable: process.execPath,
+    args: ['-e', 'process.stdout.write("TEST_SECRET".repeat(1000)); setInterval(() => {}, 1000)'], maxOutputBytes: 64 });
+  assert.equal(result.outputExceeded, true); assert.equal(result.stdout, ''); assert.equal(result.stderr, '');
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(runProcess({ executable: 'should-never-start', args: [], signal: controller.signal }), CancelledError);
+});
+
 test('runProcess 超时后结束子进程', async () => {
   const result = await runProcess({
     executable: process.execPath,
     args: ['-e', 'process.stdout.write(String(process.pid)); setInterval(() => {}, 1000)'],
-    timeoutMs: 250,
+    timeoutMs: 2_000,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -143,6 +215,23 @@ test('SSH 参数关闭转发与复用且不创建反向转发', () => {
     '-o', 'ControlPath=none',
   ]);
   assert.equal(args.includes('-R'), false);
+});
+
+test('直接连接的 ssh -G 使用相同目标覆盖；转发差异只能包含获准项', async () => {
+  const signal = new AbortController().signal;
+  const before = 'hostname example.test\nuser root\nport 22\n';
+  const result = await sshEffective({ inputMode: 'direct', hostname: 'example.test', username: 'root', sshPort: 22, signal }, {
+    sshExecutable: 'fixture-ssh', runProcess: async (request) => {
+      assert.deepEqual(request.args, ['-G', '-F', 'none', '-o', 'HostName=example.test', '-o', 'User=root', '-o', 'Port=22', 'example.test']);
+      assert.equal(request.signal, signal);
+      return { exitCode: 0, stdout: before };
+    },
+  });
+  assert.deepEqual(effectiveConnection(result), { hostname: 'example.test', username: 'root', sshPort: 22 });
+  const after = `${before}remoteforward 127.0.0.1:17890 127.0.0.1:7897\n`;
+  assert.doesNotThrow(() => assertEffectiveForwardChange(before, after, 17890, 7897));
+  assert.throws(() => assertEffectiveForwardChange(before, after.replace('user root', 'user other'), 17890, 7897), /其他变化/);
+  assert.throws(() => effectiveConnection(`${before}user other\n`), /重复/);
 });
 
 test('远端脚本和参数编码后不暴露特殊字符', () => {

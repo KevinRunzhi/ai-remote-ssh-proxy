@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>远程工作台 · 容器准备</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<main>
+  <header><span class="eyebrow">REMOTE WORKSPACE / 0.3</span><span class="badge">开发候选 · 尚未验收</span></header>
+  <section class="intro"><p class="eyebrow">从本机到云端</p><h1 id="page-title">新容器，接着用。</h1><p id="page-description">连接、代理与 Codex 准备，沿同一份进度继续。<br>先核对变更，再交给工具执行。</p></section>
+  <div id="error" class="error" role="alert" hidden></div>
+  <section id="record-review" class="question" hidden><h2>核对本机恢复记录</h2><p>只迁移旧记录或补记唯一已确认的入口切换；不会连接容器、重放配置或选择最新文件。</p><button id="review-records">查看核对预览</button></section>
+  <section id="current" class="current" hidden><div><p class="eyebrow">CURRENT TARGET / 当前目标</p><h2 id="target-name"></h2><p id="target-detail" class="muted"></p></div><p id="target-resources" class="muted"></p></section>
+  <div class="workspace">
+    <section class="panel"><h2>连接与本机默认值</h2><p class="muted">填写可信的 Linux 容器。密码只在启动终端输入，登录只在官方界面完成。</p>
+      <form id="connect-form">
+        <label for="host">简单 SSH 登录命令或 alias</label><input id="host" name="sshCommand" placeholder="ssh -p 2222 root@example.test" required maxlength="2048" autocomplete="off" spellcheck="false">
+        <label for="ssh-config">SSH config 绝对路径</label><input id="ssh-config" name="sshConfig" placeholder="使用已确认的 VS Code Remote SSH 入口" autocomplete="off" spellcheck="false">
+        <div class="business-fields">
+          <label for="proxy">本机无认证 HTTP 代理</label><input id="proxy" name="localProxy" placeholder="http://127.0.0.1:7897" autocomplete="off" spellcheck="false">
+          <label for="remote-port">远端回环端口</label><input id="remote-port" name="remotePort" type="number" min="1024" max="65535" value="17890">
+          <details><summary>非默认 VS Code 安装位置</summary><label for="code-path">Code.exe 绝对路径（通常留空）</label><input id="code-path" name="codePath" autocomplete="off" spellcheck="false"></details>
+          <label class="check-label"><input id="new-container" type="checkbox">我确认这是新建或重建的容器；已有目标先弃用。</label>
+          <button id="save-preferences" class="subtle" type="button">保存本机默认值</button>
+        </div>
+        <button id="run" type="submit">初始化新容器 <span aria-hidden="true">↗</span></button>
+      </form>
+      <details class="business-fields help"><summary>本机准备与官方安装入口</summary><p class="muted">需要 Windows OpenSSH、curl、VS Code Stable 和 Remote SSH。首次连接会准备 VS Code Server；扩展安装和官方登录按右侧步骤完成。</p><p class="links"><a href="https://code.visualstudio.com/download" target="_blank" rel="noreferrer">VS Code</a><a href="https://code.visualstudio.com/docs/remote/ssh" target="_blank" rel="noreferrer">Remote SSH</a><a href="https://learn.chatgpt.com/docs/codex/ide" target="_blank" rel="noreferrer">Codex 官方说明</a></p></details>
+    </section>
+    <section class="status-panel" aria-labelledby="status-heading"><p class="eyebrow">LIVE STATUS / 本次操作</p><h2 id="status-heading">等待开始</h2><p id="message" role="status" aria-live="polite">正在连接本地工具。</p><ol id="stages" class="stages business-fields"></ol><div id="checks" class="checks"></div><p id="evidence" class="muted-light"></p><p class="terminal-note">认证提示出现时，请切换到双击打开的终端。关闭网页不会取消任务；取消和退出请使用下方按钮。</p><div class="actions"><button id="cancel" class="secondary" disabled>取消操作</button><button id="shutdown" class="secondary">退出工具</button></div></section>
+  </div>
+  <section id="question" class="question" hidden aria-live="polite"><p class="eyebrow">REVIEW / 等待你的选择</p><h2 id="question-title"></h2><div id="question-body"></div><div id="question-actions" class="actions"></div></section>
+  <section id="target-actions" class="business-fields target-actions" hidden><label class="check-label"><input id="original-container" type="checkbox">我确认这是记录中的原容器。重建后请先弃用旧目标。</label><label id="reconfigure-label" class="check-label" hidden><input id="reconfigure" type="checkbox">已移除，明确建立新代理周期</label><div class="actions"><button data-operation="resume">继续初始化</button><button data-operation="verify" class="subtle">独立检查</button><button data-operation="remove" class="subtle">移除代理，保留连接</button><button data-operation="abandon" class="subtle danger">弃用旧容器</button></div><p class="muted">弃用不要求旧远端可达，本机增量可选择清理或保留。移除不会卸载软件或关闭 VS Code 会话。</p></section>
+  <footer><span>本机回环 · 无外部页面资源</span><span>配置、联网、新回复与路径归因分别核对</span></footer>
+</main>
+</body></html>

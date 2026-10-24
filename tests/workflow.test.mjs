@@ -12,7 +12,7 @@ import {
 } from '../scripts/ssh.mjs';
 
 import { sha256 } from '../scripts/config.mjs';
-import { parseArgs, runCommand } from '../scripts/e2e.mjs';
+import { parseArgs, runCommand } from '../scripts/legacy-cli.mjs';
 
 const SSH_ORIGINAL = 'Host dev-linux\n  HostName example.invalid\n';
 const SETTINGS_ORIGINAL = '{\n  // keep\n  "editor.tabSize": 2\n}\n';
@@ -423,7 +423,8 @@ test('remove 可读取 T0 旧版恢复记录', async () => {
 test('remove 在用户后续修改后停止并保留记录', async () => {
   const harness = await makeHarness();
   try {
-    assert.equal(await runCommand({ command: 'configure', options: harness.options, io: makeIo().io, dependencies: harness.dependencies }), 0);
+    const configured = makeIo();
+    assert.equal(await runCommand({ command: 'configure', options: harness.options, io: configured.io, dependencies: harness.dependencies }), 0, configured.messages.join('\n'));
     await fs.appendFile(harness.sshConfig, '# user change\n');
     const output = makeIo();
     assert.equal(await runCommand({ command: 'remove', options: {}, io: output.io, dependencies: harness.dependencies }), 1);
