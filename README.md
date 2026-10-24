@@ -1,5 +1,13 @@
 # codex-remote-ssh-proxy-automation
 
+## 当前版本与 Mac 交接入口
+
+- **Mac 接手开发：先读 [Mac 迁移交接](docs/mac-handoff/README.md)**，包含总体思路、实现经验、本机分析与实施建议，以及可复制给 Mac Codex 的开场消息。当前尚未完成 Mac 适配。
+- Windows 当前开发版本为 v0.3：[PRD](docs/PRD_V0.3.md)、[技术架构](docs/TECHNICAL_ARCHITECTURE_V0.3.md)、[Spec](docs/SPEC_V0.3.md)、[验证记录](docs/E2E_RUN_V0.3.md)。内部候选仍有未完成验收项。
+- 下方保留 v0.1 CLI 使用说明；其中历史锁处理方式不适用于 v0.3，当前恢复应遵循 v0.3 Spec。
+
+## v0.1 历史使用说明
+
 帮助 Windows 用户把本地无认证 HTTP 代理通过 SSH 反向转发给远端 Linux，供 VS Code Remote SSH 中运行的 Codex 使用。
 
 当前已完成 T5 与首版验收：`configure` / `verify` / `remove` 已在真实 Windows → Linux → VS Code Remote SSH 环境形成完整闭环，并取得实际 Codex 进程的代理路径证据；失败与恢复边界已通过受控测试。首版范围与验收标准以 [PRD.md](PRD.md) 为唯一依据。
